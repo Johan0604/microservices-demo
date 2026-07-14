@@ -26,3 +26,9 @@ obj/
 pkg/
 release/wi-kubernetes-manifests.yaml
 vendor/
+
+cosign.key
+cosign.pub
+*-report.json
+*-report.html
+*.sarif

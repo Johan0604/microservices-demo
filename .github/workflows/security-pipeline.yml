@@ -127,7 +127,7 @@ jobs:
   # ── Capa 3: Build + Trivy (gate) + push + firma con Cosign ──────────
   build-scan-sign:
     name: Build, scan & sign (${{ matrix.service }})
-    needs: [code-security, lint]
+    needs: [code-security]
     runs-on: ubuntu-latest
     permissions:
       contents: read

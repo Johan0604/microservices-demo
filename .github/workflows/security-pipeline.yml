@@ -1,0 +1,193 @@
+name: Security Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ── Capa 1: Seguridad de código, sobre todo el repo ─────────────────
+  code-security:
+    name: Gitleaks + Semgrep + Trivy (repo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Gitleaks necesita el historial completo
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: auto
+
+      - name: Trivy filesystem scan (informativo, no bloquea)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+  # ── Capa 2: Linting por servicio/lenguaje ───────────────────────────
+  lint:
+    name: Lint (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { service: frontend,                lang: go,     path: src/frontend }
+          - { service: checkoutservice,          lang: go,     path: src/checkoutservice }
+          - { service: productcatalogservice,    lang: go,     path: src/productcatalogservice }
+          - { service: shippingservice,          lang: go,     path: src/shippingservice }
+          - { service: currencyservice,          lang: node,   path: src/currencyservice }
+          - { service: paymentservice,           lang: node,   path: src/paymentservice }
+          - { service: emailservice,             lang: python, path: src/emailservice }
+          - { service: loadgenerator,            lang: python, path: src/loadgenerator }
+          - { service: recommendationservice,    lang: python, path: src/recommendationservice }
+          - { service: shoppingassistantservice, lang: python, path: src/shoppingassistantservice }
+          - { service: adservice,                lang: java,   path: src/adservice }
+          - { service: cartservice,              lang: csharp, path: src/cartservice/src }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        if: matrix.lang == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: golangci-lint
+        if: matrix.lang == 'go'
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12
+          working-directory: ${{ matrix.path }}
+          args: --timeout 5m
+
+      - name: Set up Node
+        if: matrix.lang == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: ESLint
+        if: matrix.lang == 'node'
+        working-directory: ${{ matrix.path }}
+        run: |
+          npm install --no-save eslint
+          npx eslint . --ext .js || true
+
+      - name: Set up Python
+        if: matrix.lang == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Ruff
+        if: matrix.lang == 'python'
+        working-directory: ${{ matrix.path }}
+        run: |
+          pip install ruff
+          ruff check . || true
+
+      - name: Set up Java
+        if: matrix.lang == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '24'
+
+      - name: Checkstyle (via Gradle)
+        if: matrix.lang == 'java'
+        working-directory: ${{ matrix.path }}
+        run: ./gradlew checkstyleMain || true
+
+      - name: Set up .NET
+        if: matrix.lang == 'csharp'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: dotnet format (verificación)
+        if: matrix.lang == 'csharp'
+        working-directory: ${{ matrix.path }}
+        run: dotnet format --verify-no-changes || true
+
+  # ── Capa 3: Build + Trivy (gate) + push + firma con Cosign ──────────
+  build-scan-sign:
+    name: Build, scan & sign (${{ matrix.service }})
+    needs: [code-security, lint]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # requerido para la firma keyless de Cosign
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { service: frontend,                context: src/frontend,                dockerfile: src/frontend/Dockerfile }
+          - { service: adservice,                context: src/adservice,                dockerfile: src/adservice/Dockerfile }
+          - { service: cartservice,              context: src/cartservice/src,          dockerfile: src/cartservice/src/Dockerfile }
+          - { service: checkoutservice,          context: src/checkoutservice,          dockerfile: src/checkoutservice/Dockerfile }
+          - { service: currencyservice,          context: src/currencyservice,          dockerfile: src/currencyservice/Dockerfile }
+          - { service: emailservice,             context: src/emailservice,             dockerfile: src/emailservice/Dockerfile }
+          - { service: loadgenerator,            context: src/loadgenerator,            dockerfile: src/loadgenerator/Dockerfile }
+          - { service: paymentservice,           context: src/paymentservice,           dockerfile: src/paymentservice/Dockerfile }
+          - { service: productcatalogservice,    context: src/productcatalogservice,    dockerfile: src/productcatalogservice/Dockerfile }
+          - { service: recommendationservice,    context: src/recommendationservice,    dockerfile: src/recommendationservice/Dockerfile }
+          - { service: shippingservice,          context: src/shippingservice,          dockerfile: src/shippingservice/Dockerfile }
+          - { service: shoppingassistantservice, context: src/shoppingassistantservice, dockerfile: src/shoppingassistantservice/Dockerfile }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (solo local, sin publicar)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: true
+          tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:${{ github.sha }}
+
+      - name: Trivy scan (GATE — bloquea si hay CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: 1
+
+      - name: Publicar imagen (solo si pasó el gate)
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:${{ github.sha }}
+
+      - name: Instalar Cosign
+        uses: sigstore/cosign-installer@v4
+
+      - name: Firmar imagen (keyless, vía identidad de GitHub Actions)
+        run: |
+          cosign sign --yes \
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}@${{ steps.push.outputs.digest }}
